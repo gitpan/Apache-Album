@@ -1,9 +1,9 @@
-package Apache::Album;
+package Apache::Album; 
 
 # For detailed information on this module, please see
 # the pod data at the bottom of this file
 #
-# Copyright 1998-1999 James D Woodgate.  All rights reserved.
+# Copyright 1998-2000 James D Woodgate.  All rights reserved.
 # It may be used and modified freely, but I do request that this copyright
 # notice remain attached to the file.  You may modify this module as you 
 # wish, but if you redistribute a modified version, please attach a note
@@ -15,7 +15,7 @@ use vars qw($VERSION);
 use Apache::Constants qw/:common REDIRECT/;
 use Apache::Request;
 
-$VERSION = '0.92';
+$VERSION = '0.93';
 
 sub handler {
   my $r = Apache::Request->new(shift);
@@ -36,6 +36,8 @@ sub handler {
     $r->dir_config('ThumbSubDir')         || 'thumbs';
   $settings{'DefaultBrowserWidth'} = 
     $r->dir_config('DefaultBrowserWidth') || 640;
+  $settings{'NumberOfColumns'} =
+    $r->dir_config('NumberOfColumns')     || 0;
   $settings{'BodyArgs'} = 
     $r->dir_config('BodyArgs');
   $settings{'OutsideTableBorder'} = 
@@ -43,7 +45,7 @@ sub handler {
   $settings{'InsideTablesBorder'} = 
     $r->dir_config('InsideTablesBorder')  || 0;
   $settings{'Footer'} = 
-    $r->dir_config('Footer');
+    $r->dir_config('Footer')              || '<address>Apache::Album</address>';
   $settings{'EditMode'} =
     $r->dir_config('EditMode') || 0;
   $settings{'AllowFinalResize'} =
@@ -64,23 +66,32 @@ sub handler {
 
   # Check and see if there was a post
   my %params = ();
-  if ($settings{'EditMode'}) {
-    %params = $r->method eq 'POST' ? $r->content : $r->args;
+  %params = $r->method eq 'POST' ? $r->content : $r->args;
 
-#    foreach (keys %params) {
-#      $r->log_error("$_ -> $params{$_}");
-#    }
+#  foreach (keys %params) {
+#    $r->log_error("$_ -> $params{$_}");
+#  }
+  if ($settings{'EditMode'}) {
 
     if (defined $params{'AlbumName'}) {
       my $directory = $params{AlbumName};
       $directory =~ s,[^\w\d()],,g;
+
+      # Since the only things that can get through are letters, 
+      # numbers or parenthesis $directory should be safe
+      if ($directory =~ /([\w\d()]+)/) {
+        $directory = $1;
+      }
+
       my $local_path_info = $r->path_info;
       if ($directory eq "") {
 	$r->log_error("Directory empty (or only consists of bad characters)");
       }
       else {
-	$r->warn("Creating New Album: $directory under $local_path_info");
-	mkdir("$album_dir$local_path_info$directory", 0755);
+	my $new_dir = "$album_dir$local_path_info$directory";
+	$new_dir =~ s!/{2,},!/!g;
+	$r->warn("Creating New Album: $new_dir");
+	mkdir($new_dir, 0755);
       }
     }
     else {
@@ -116,14 +127,17 @@ sub handler {
     }
   }
 
-  # path_info will be the sub directory/possible file_name
-  # get rid of any slashes so we can make sure that paths
-  # look like paths
   my $path_info = $r->path_info;
   $path_info =~ s!^/+!!;
   $path_info =~ s!/+$!!;
+
+  update_settings($r, \%settings, $album_dir, $path_info);
+
+  # path_info will be the sub directory/possible file_name
+  # get rid of any slashes so we can make sure that paths
+  # look like paths
   $path_info || return &show_albums($r, $album_dir, $path_info, \%settings);
-  
+
   # do we have a directory or a filename, if it's a filename
   # simply load it up
   if ( -f "$album_dir/$path_info" ) {
@@ -146,7 +160,6 @@ sub handler {
     }
   }
   
-
   # We have a directory, but does $path_info end in a
   # / like all good directories should?  If not, add
   # it and do a redirect, makes the pictures show up
@@ -163,39 +176,20 @@ sub handler {
     $r->log_error("Couldn't open $album_dir/$path_info: $!");
     return SERVER_ERROR;
   }
-  my @files = grep { $r->lookup_uri("$album_uri/$_")->content_type =~ 
-		       m!^image/! && !/^tn__/ } readdir(IN);
-  closedir(IN);
 
+  my @files = grep { !/\.htaccess/ && !/^tn__/
+		       && $r->lookup_uri("$album_uri/$_")->content_type =~ 
+		       m!^image/!} readdir(IN);
+  closedir(IN);
 
   # if @files is empty, need to call show_albums
   return &show_albums($r, "$album_dir/$path_info", $path_info, \%settings)
     unless @files;
 
-  # check to see if there is an .htaccess file there, if so
-  # parse it looking for PerlSetVar's that override the defaults/
-  # httpd.conf files
-  if ( -f "$album_dir/$path_info/.htaccess") {
-    if (open (IN,"$album_dir/$path_info/.htaccess")) {
-      while (<IN>) {
-	next if /^\s*$/;
-	next if /^\#/;
-	if (/^PerlSetVar\s+(\w+)\s+(.*)$/) {
-	  my ($key,$value) = ($1,$2);
-	  $settings{$key} = $value;
-        }
-      }
-      close IN;
-    }
-    else {
-      $r->log_error("Couldn't open $album_dir/$path_info/.htaccess: $!");
-    }
-  }
-
   @files = sort @files;
   @files = reverse @files
     if $settings{'ReversePics'};
-    
+
   # Load up thumbnails
   # Unless the thumbnail file exists, and
   # is newer than the file it's a thumbnail for, generate the
@@ -261,59 +255,9 @@ sub handler {
 	  return SERVER_ERROR;
 	}
 
-	$q->Read("$album_dir/$path_info/$_");
-	$ratio = $o_width / $o_height if $o_height;
+	my $filename = $_;
+	$r->register_cleanup(sub {&create_final_resize($r, \%settings, $q, $album_dir, $path_info, $filename, $o_width, $o_height);});
 
-	# Large is 1024x768
-	if ($o_width > 1024) {
-	  my $f_height = 0;
-	  $f_height = 1024 / $ratio if $ratio;
-
-	  undef $q;
-	  $q = new Image::Magick;
-	  unless ($q) {
-	    $r->log_error("Couldn't create a new Image::Magick object");
-	    return SERVER_ERROR;
-	  }
-
-	  $q->Read("$album_dir/$path_info/$_");
-	  $q->Sample( width => 1024, height => $f_height );
-	  $q->Write("$album_dir/$path_info/$settings{FinalResizeDir}/1024x768_$_");
-	}
-
-	# Med is 800x600
-	if ($o_width > 800) {
-	  my $f_height = 0;
-	  $f_height = 800 / $ratio if $ratio;
-
-	  undef $q;
-	  $q = new Image::Magick;
-	  unless ($q) {
-	    $r->log_error("Couldn't create a new Image::Magick object");
-	    return SERVER_ERROR;
-	  }
-
-	  $q->Read("$album_dir/$path_info/$_");
-	  $q->Sample( width => 800, height => $f_height );
-	  $q->Write("$album_dir/$path_info/$settings{FinalResizeDir}/800x600_$_");
-	}
-
-	# Sm is 640x480
-	if ($o_width > 640) {
-	  my $f_height = 0;
-	  $f_height = 640 / $ratio if $ratio;
-
-	  undef $q;
-	  $q = new Image::Magick;
-	  unless ($q) {
-	    $r->log_error("Couldn't create a new Image::Magick object");
-	    return SERVER_ERROR;
-	  }
-
-	  $q->Read("$album_dir/$path_info/$_");
-	  $q->Sample( width => 640, height => $f_height );
-	  $q->Write("$album_dir/$path_info/$settings{FinalResizeDir}/640x480_$_");
-	}
       }
   
     }
@@ -346,6 +290,9 @@ EOF
   #
   # HTML tags are welcome in the entire file
   my $caption_file = "$album_dir/$path_info/caption.txt";
+  # Account for varieties of using Alias
+  $caption_file =~ s!/{2,}!/!g;
+
   my %picture_captions;
   my $state = "Caption";
   if ( -r $caption_file ) {
@@ -370,10 +317,13 @@ EOF
   # exact sizes for each row but that would slow us down, and we
   # really don't need to be all the picky, do we? :)
 
-  # Use $settings{'DefaultBrowserWidth'} and 
+  # If NumberOfColumns is > 0 then use that, otherwise
+  # use $settings{'DefaultBrowserWidth'} and 
   # $settings{'ThumbNailWidth'}to determine how many thumbnails per row
   $r->print(qq!<TABLE BORDER=$settings{'OutsideTableBorder'}><TR>!);
   my $pixels_so_far = $settings{'ThumbNailWidth'};
+  my $columns_so_far = 0;
+
   foreach (@files) {
     my $message = $_;
     if ($picture_captions{$message}) {
@@ -404,13 +354,51 @@ EOF
 	if $resize_strings;
     }
 
-    $r->print(qq!<TD ALIGN="center"><TABLE BORDER=$settings{'InsideTablesBorder'}><TR><TD ALIGN="center"><A HREF="$_">! .
-	      qq!<IMG SRC="$album_uri/$path_info/$settings{ThumbSubDir}/tn__$_" ALT="$_"></A>$resize_urls</TD></TR>!,
-	      qq!<TR><TD ALIGN="center">$message</TD></TR></TABLE></TD>\n!);
-    $pixels_so_far += $settings{'ThumbNailWidth'};
-    if ($pixels_so_far > $settings{'DefaultBrowserWidth'}) {
-      $r->print(qq!</TR><TR>!);
-      $pixels_so_far = $settings{'ThumbNailWidth'};
+    if (exists $params{'all_full_images'}) {
+      my $picture = $_;
+      for ($params{'all_full_images'}) {
+	/full/ || !$settings{'AllowFinalResize'} and do {
+	  $r->print(qq!<CENTER><IMG SRC="$album_uri/$path_info/$picture" ALT="$picture"></CENTER>!);
+	  last; };
+	/sm/ and do {
+	  $r->print(qq!<CENTER><IMG SRC="!
+             . (-f "$album_dir/$path_info/$settings{FinalResizeDir}/640x480_$picture"
+             ? "$album_uri/$path_info/$settings{FinalResizeDir}/640x480_$picture"
+		    : "$album_uri/$path_info/$picture")
+		    . qq!" ALT="$picture"></CENTER>!);
+	  last; };
+	/med/ and do {
+	  $r->print(qq!<CENTER><IMG SRC="!
+             . (-f "$album_dir/$path_info/$settings{FinalResizeDir}/800x600_$picture"
+             ? "$album_uri/$path_info/$settings{FinalResizeDir}/800x600_$picture"
+		    : "$album_uri/$path_info/$picture")
+		    . qq!" ALT="$picture"></CENTER>!);
+	  last; };
+	/lg/ and do {
+	  $r->print(qq!<CENTER><IMG SRC="!
+             . (-f "$album_dir/$path_info/$settings{FinalResizeDir}/1024x768_$picture"
+             ? "$album_uri/$path_info/$settings{FinalResizeDir}/1024x768_$picture"
+		    : "$album_uri/$path_info/$picture")
+		    . qq!" ALT="$picture"></CENTER>!);
+	  last; };
+	$r->print(qq!<CENTER><IMG SRC="$album_uri/$path_info/$picture" ALT="$picture"></CENTER>!);
+      }
+      $r->print(qq!<HR><CENTER>$message</CENTER><HR>!);
+    }
+    else {
+      $r->print(qq!<TD ALIGN="center"><TABLE BORDER=$settings{'InsideTablesBorder'}><TR><TD ALIGN="center"><A HREF="$_">! .
+		qq!<IMG SRC="$album_uri/$path_info/$settings{ThumbSubDir}/tn__$_" ALT="$_"></A>$resize_urls</TD></TR>!,
+		qq!<TR><TD ALIGN="center">$message</TD></TR></TABLE></TD>\n!);
+      $pixels_so_far += $settings{'ThumbNailWidth'};
+      $columns_so_far++;
+      
+      if ($settings{'NumberOfColumns'} > 0
+	  ? ($columns_so_far >= $settings{'NumberOfColumns'} )
+	  : ($pixels_so_far > $settings{'DefaultBrowserWidth'})) {
+	$r->print(qq!</TR><TR>!);
+	$pixels_so_far = $settings{'ThumbNailWidth'};
+	$columns_so_far = 0;
+      }
     }
   }
 
@@ -420,8 +408,6 @@ EOF
   }
   $r->print("<hr>\n$settings{'Footer'}\n<hr>") if $settings{'Footer'};
   $r->print(<<EOF);
-<HR>
-<address>Generated by Apache::Album</address>
 </BODY>
 </HTML>
 EOF
@@ -487,7 +473,6 @@ EOF
 </BODY>
 </HTML>
 EOF
-
   return OK;  
 }
 
@@ -562,7 +547,7 @@ sub show_picture {
 <HR>
 $caption</CENTER>
 <HR>
-  <address>Brought to you by Apache::Album</address>
+$$settings{'Footer'}
 </BODY>
 </HTML>
 EOF
@@ -578,7 +563,7 @@ sub list_dirs {
 
   my $text = $directory;
   $text =~ tr[-_][  ];
-  $text =~ s,\d+\((.*)\),\1,;
+  $text =~ s,\d+\((.*)\),$1,;
   $r->print(qq!<dl><dt><A HREF="$old_directory$directory/">$text</A></dt>\n!);
 
   my @dirs = ();
@@ -605,9 +590,36 @@ sub list_dirs {
 
   @dirs = sort @dirs;
 
-  @dirs = reverse @dirs
-    if $settings->{'ReverseDirs'};
+  if (-f "$album_dir/$directory/.htaccess") {
+    my $override = 0;
 
+    # check if ReverseDirs is specified in here
+    if (open (IN, "$album_dir/$directory/.htaccess")) {
+      while (<IN>) {
+	if (/ReverseDirs\s+(.*)$/) {
+	  @dirs = reverse @dirs
+	    if $1;
+	  $override = 1;
+	}
+      }
+      close IN;
+
+      unless ($override) {
+	@dirs = reverse @dirs
+	  if $settings->{'ReverseDirs'};
+      }
+      
+    }
+    else {
+      @dirs = reverse @dirs
+	if $settings->{'ReverseDirs'};
+    }
+  }
+  else {
+    @dirs = reverse @dirs
+      if $settings->{'ReverseDirs'};
+  }
+  
   foreach (@dirs) {
     &list_dirs($r, "$album_dir/$directory", $_, "$old_directory$directory/", $settings);
   }
@@ -629,8 +641,102 @@ EOF
   ;
 
   return $ret;
-
 }
+
+sub create_final_resize {
+  my ($r, $settings, $q, $album_dir, $path_info, $filename, $o_width, $o_height) = @_;
+
+  $q->Read("$album_dir/$path_info/$filename");
+  my $ratio = $o_width / $o_height if $o_height;
+
+  # Large is 1024x768
+  if ($o_width > 1024) {
+    my $f_height = 0;
+    $f_height = 1024 / $ratio if $ratio;
+    
+    undef $q;
+    $q = new Image::Magick;
+    unless ($q) {
+      $r->log_error("Couldn't create a new Image::Magick object");
+      return SERVER_ERROR;
+    }
+    
+    $q->Read("$album_dir/$path_info/$filename");
+    $q->Sample( width => 1024, height => $f_height );
+    $q->Write("$album_dir/$path_info/"
+	      . $settings->{FinalResizeDir}
+	      . "/1024x768_$filename");
+  }
+  
+  # Med is 800x600
+  if ($o_width > 800) {
+    my $f_height = 0;
+    $f_height = 800 / $ratio if $ratio;
+    
+    undef $q;
+    $q = new Image::Magick;
+    unless ($q) {
+      $r->log_error("Couldn't create a new Image::Magick object");
+      return SERVER_ERROR;
+    }
+    
+    $q->Read("$album_dir/$path_info/$filename");
+    $q->Sample( width => 800, height => $f_height );
+    $q->Write("$album_dir/$path_info/"
+	      . $settings->{FinalResizeDir}
+	      . "/800x600_$filename");
+  }
+  
+  # Sm is 640x480
+  if ($o_width > 640) {
+    my $f_height = 0;
+    $f_height = 640 / $ratio if $ratio;
+    
+    undef $q;
+    $q = new Image::Magick;
+    unless ($q) {
+      $r->log_error("Couldn't create a new Image::Magick object");
+      return SERVER_ERROR;
+    }
+    
+    $q->Read("$album_dir/$path_info/$filename");
+    $q->Sample( width => 640, height => $f_height );
+    $q->Write("$album_dir/$path_info/"
+	      . $settings->{FinalResizeDir}
+	      . "/640x480_$filename");
+  }
+  
+}
+
+sub update_settings {
+  my ($r, $settings, $album_dir, $path_info) = @_;
+  my $current_path = "$album_dir/";
+  foreach my $next_dir (split(m|/|, $path_info)) {
+    $current_path .= "$next_dir/";
+
+    # check to see if there is an .htaccess file there, if so
+    # parse it looking for PerlSetVar's that override the defaults/
+    # httpd.conf files
+    if ( -f "$current_path/.htaccess") {
+      if (open (IN,"$current_path/.htaccess")) {
+	while (<IN>) {
+	  next if /^\s*$/;
+	  next if /^\#/;
+	  if (/^PerlSetVar\s+(\w+)\s+(.*)$/) {
+	    my ($key,$value) = ($1,$2);
+	    $settings->{$key} = $value;
+	  }
+	}
+	close IN;
+      }
+      else {
+	$r->log_error("Couldn't open $current_path/.htaccess: $!");
+      }
+    }
+  }
+}
+
+
 
 1;
 __END__
@@ -652,6 +758,7 @@ Add to httpd.conf
 #   PerlSetVar  ThumbNailAspect     2/11
 #   PerlSetVar  ThumbSubDir         thumbs
 #   PerlSetVar  DefaultBrowserWidth 640
+#   PerlSetVar  NumberOfColumns     0
 #   PerlSetVar  OutsideTableBorder  0
 #   PerlSetVar  InsideTablesBorder  0
 #   PerlSetVar  BodyArgs            BGCOLOR=white
@@ -670,9 +777,8 @@ directory, create an optional text block (in a file called
 caption.txt) to go at the top, and the module does the rest.  It does
 however require that PerlMagick be installed.
 
-Default settings in the httpd.conf file may be overriden by creating a
-.htaccess file in the same directory as the image files and the
-caption.txt file.
+Default settings in the httpd.conf file may be overriden by using
+.htaccess files.
 
 =head1 INSTALLATION
 
@@ -745,7 +851,7 @@ to the full sized images.
 =item The caption.txt file
 
 The caption.txt file consists of two parts.  The first part is
-text/html, that will be placed at the top of the html document.  The
+text/html that will be placed at the top of the html document.  The
 second part is a mapping of filenames to captions.  The module will do
 some simple mangling of the image file names to create the caption.
 But if it finds a mapping in the caption.txt file, that value is used
@@ -804,6 +910,13 @@ used to allow multiple sets of thumbnails).
 A general number of how wide you want the final table to be, not an
 absolute number.  If the next image would take it past this "invisible
 line", a new row is started.
+
+=item NumberOfColumns
+
+Instead of using DefaultBrowserWidth and a guess at the number of
+pixels, NumberOfColumns can be set to the maximum number of columns in
+a table.  The default is 0 (which causes DefaultBrowserWidth to be
+used instead).
 
 =item BodyArgs
 
@@ -867,6 +980,24 @@ true, the order of the pictures will be reversed.
 
 =back
 
+=head1 OTHER FEATURES
+
+For people with lots of bandwidth and memory, Apache::Album can
+generate a single page with all the full sized pictures (or all the
+Small(sm), Medium(med) or Large(lg) pictures if AllowFinalResize is
+turned on).  This is enabled by passing
+?all_full_images=sm|med|lg|full to the url of an album, for example:
+
+=over 2
+
+C<http://your.web.server/albums/specific_album/?all_full_images=sm>
+
+=back
+
+Will create a page with all the picutres in an album, but none will be
+larger than 640x480.  The pictures will have captions as if the
+pictures were being viewed one at a time.
+
 =head1 LIMITATIONS 
 
 PerlMagick is a limiting factor.  If PerlMagick can't load the image,
@@ -874,7 +1005,7 @@ no thumbnail will be created.
 
 =head1 COPYRIGHT
 
-Copyright (c) 1998-1999 Jim Woodgate. All rights reserved. This
+Copyright (c) 1998-2000 Jim Woodgate. All rights reserved. This
 program is free software; you can redistribute it and/or modify it
 under the same terms as Perl itself.
 
