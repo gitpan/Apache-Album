@@ -1,5 +1,9 @@
 Revision history for mod_perl module Apache::Album.
-
+0.94  Sat Jun 10 16:01:00 2000
+        - Fixed bug where not all small/med/large pictures were being
+          created.
+	- Removed <H3> tags from the title of the page when a full sized 
+	  picture is displayed.
 0.93  Wed Apr 05 23:16:00 2000
 	- Moved generation of small/med/large pictures to a cleanup
 	  handler, makes the initial loading of a page much faster!

@@ -1,4 +1,4 @@
-package Apache::Album; 
+package Apache::Album;
 
 # For detailed information on this module, please see
 # the pod data at the bottom of this file
@@ -15,7 +15,7 @@ use vars qw($VERSION);
 use Apache::Constants qw/:common REDIRECT/;
 use Apache::Request;
 
-$VERSION = '0.93';
+$VERSION = '0.94';
 
 sub handler {
   my $r = Apache::Request->new(shift);
@@ -190,6 +190,8 @@ sub handler {
   @files = reverse @files
     if $settings{'ReversePics'};
 
+  my @cleanup_subs = ();
+
   # Load up thumbnails
   # Unless the thumbnail file exists, and
   # is newer than the file it's a thumbnail for, generate the
@@ -256,12 +258,15 @@ sub handler {
 	}
 
 	my $filename = $_;
-	$r->register_cleanup(sub {&create_final_resize($r, \%settings, $q, $album_dir, $path_info, $filename, $o_width, $o_height);});
+	push (@cleanup_subs, sub {&create_final_resize($r, \%settings, $album_dir, $path_info, $filename, $o_width, $o_height);});
 
       }
   
     }
   }
+
+  $r->register_cleanup(sub {foreach (@cleanup_subs) {&$_;}})
+    if @cleanup_subs;
 
   # The title will be a hacked up path_info, only the
   # last directory, transform -_ to space
@@ -320,7 +325,7 @@ EOF
   # If NumberOfColumns is > 0 then use that, otherwise
   # use $settings{'DefaultBrowserWidth'} and 
   # $settings{'ThumbNailWidth'}to determine how many thumbnails per row
-  $r->print(qq!<TABLE BORDER=$settings{'OutsideTableBorder'}><TR>!);
+  $r->print(qq!<CENTER><TABLE BORDER=$settings{'OutsideTableBorder'}><TR>!);
   my $pixels_so_far = $settings{'ThumbNailWidth'};
   my $columns_so_far = 0;
 
@@ -402,7 +407,7 @@ EOF
     }
   }
 
-  $r->print("</TR></TABLE>\n");
+  $r->print("</TR></TABLE></CENTER>\n");
   if ($settings{'EditMode'}) {
     $r->print(&file_upload());
   }
@@ -493,6 +498,9 @@ sub show_picture {
   $caption =~ s!.*/!!;
   $caption =~ s!\.[^.]*$!!;
   $caption =~ tr[-_][  ];
+
+  my $title = $caption;
+
   $caption = qq!<H3>$caption</H3>!;
 
   my ($path_dir,$path_file) = $path_info =~ m!(.*)/(.*)!;
@@ -541,7 +549,7 @@ sub show_picture {
   $r->content_type('text/html');
   $r->send_http_header();
   $r->print(<<EOF);
-<HTML><HEADER><TITLE>$caption</TITLE></HEADER>
+<HTML><HEADER><TITLE>$title</TITLE></HEADER>
 <BODY $$settings{'BodyArgs'}>
 <CENTER>$start_link<IMG SRC="$modified_path_info" ALT="$path_info">$end_link
 <HR>
@@ -644,9 +652,11 @@ EOF
 }
 
 sub create_final_resize {
-  my ($r, $settings, $q, $album_dir, $path_info, $filename, $o_width, $o_height) = @_;
+  my ($r, $settings, $album_dir, $path_info, $filename, $o_width, $o_height) = @_;
 
+  my $q = new Image::Magick;
   $q->Read("$album_dir/$path_info/$filename");
+
   my $ratio = $o_width / $o_height if $o_height;
 
   # Large is 1024x768
