@@ -14,7 +14,7 @@ use strict;
 use vars qw($VERSION);
 use Apache::Constants qw/:common REDIRECT/;
 
-$VERSION = '0.90';
+$VERSION = '0.91';
 
 sub handler {
   my $r = shift;
