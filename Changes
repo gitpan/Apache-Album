@@ -1,5 +1,14 @@
-Revision history for Perl extension Apache::Album.
+Revision history for mod_perl module Apache::Album.
 
+0.92  Wed Dec  1 23:16:00 1999
+        - Added Sm Med Lg tags if AllowFinalResize is set, this creates smaller
+          versions of the pictures, for people with small screens and/or small
+          bandwidth
+        - Added ReverseDirs/ReversePics which if set reverses the sort order
+          of directories/pictures
+        - Added EditMode which if set allows the end user to create new albums
+          and upload pictures
+ 
 0.01  Mon Sep 14 13:19:21 1998
 	- original version; created by h2xs 1.18
 

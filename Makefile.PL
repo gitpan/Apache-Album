@@ -4,5 +4,6 @@ use ExtUtils::MakeMaker;
 WriteMakefile( 'NAME'	      => 'Apache::Album',
 	       'VERSION_FROM' => 'Album.pm', # finds $VERSION
 	       'PREREQ_PM'    => { 'Image::Magick' => 1.45, 
+				   'Apache::Request' => 0.31,
 				 },
 	     );
