@@ -3,7 +3,7 @@ package Apache::Album;
 # For detailed information on this module, please see
 # the pod data at the bottom of this file
 #
-# Copyright 1998-2000 James D Woodgate.  All rights reserved.
+# Copyright 1998-2001 James D Woodgate.  All rights reserved.
 # It may be used and modified freely, but I do request that this copyright
 # notice remain attached to the file.  You may modify this module as you 
 # wish, but if you redistribute a modified version, please attach a note
@@ -14,8 +14,9 @@ use strict;
 use vars qw($VERSION);
 use Apache::Constants qw/:common REDIRECT/;
 use Apache::Request;
+use Apache::URI ();
 
-$VERSION = '0.94';
+$VERSION = '0.95';
 
 sub handler {
   my $r = Apache::Request->new(shift);
@@ -32,8 +33,8 @@ sub handler {
     $r->dir_config('ThumbNailWidth')      || 100;
   $settings{'ThumbNailAspect'}  = 
     $r->dir_config('ThumbNailAspect')     || "1/5";
-  $settings{'ThumbSubDir'} =
-    $r->dir_config('ThumbSubDir')         || 'thumbs';
+  $settings{'ThumbDir'} =
+    $r->dir_config('ThumbDir')            || '/thumbs';
   $settings{'DefaultBrowserWidth'} = 
     $r->dir_config('DefaultBrowserWidth') || 640;
   $settings{'NumberOfColumns'} =
@@ -44,14 +45,24 @@ sub handler {
     $r->dir_config('OutsideTableBorder')  || 0;
   $settings{'InsideTablesBorder'} = 
     $r->dir_config('InsideTablesBorder')  || 0;
+  $settings{'SlideShowDelay'} = 
+    $r->dir_config('SlideShowDelay')  || 60;
   $settings{'Footer'} = 
-    $r->dir_config('Footer')              || '<address>Apache::Album</address>';
+    $r->dir_config('Footer')              ||  '<center>Slide Show: '
+      . '<a href="?slide_show=sm">small</a> | '
+      . '<a href="?slide_show=med">medium</a> | '
+      . '<a href="?slide_show=lg">large</a> | '
+      . '<a href="?slide_show=full">full sized</a></center><br>'
+      . '<center>All Images: '
+      . '<a href="?all_full_images=sm">small</a> | '
+      . '<a href="?all_full_images=med">medium</a> | '
+      . '<a href="?all_full_images=lg">large</a> | '
+      . '<a href="?all_full_images">full sized</a>'
+      . '</center><br><address>Apache::Album</address>';
   $settings{'EditMode'} =
     $r->dir_config('EditMode') || 0;
   $settings{'AllowFinalResize'} =
     $r->dir_config('AllowFinalResize') || 0;
-  $settings{'FinalResizeDir'} =
-    $r->dir_config('FinalResizeDir') || $r->dir_config('ThumbSubDir');
   $settings{'ReverseDirs'} =
     $r->dir_config('ReverseDirs') || 0;
   $settings{'ReversePics'} = 
@@ -63,6 +74,13 @@ sub handler {
   $album_uri .= "/" unless substr($album_uri,-1,1) eq '/';
   my $album_dir = $r->lookup_uri($album_uri)->filename;
   chop $album_uri;  # Won't need that '/' any more
+
+  # Set up $thumb_uri and $thumb_dir, _uri for web access, _dir
+  # for physical access to the files...
+  my $thumb_uri = $settings{'ThumbDir'};
+  $thumb_uri .= "/" unless substr($thumb_uri,-1,1) eq '/';
+  my $thumb_dir = $r->lookup_uri($thumb_uri)->filename;
+  chop $thumb_uri;  # Won't need that '/' any more
 
   # Check and see if there was a post
   my %params = ();
@@ -141,7 +159,7 @@ sub handler {
   # do we have a directory or a filename, if it's a filename
   # simply load it up
   if ( -f "$album_dir/$path_info" ) {
-    return &show_picture($r, $album_uri, $path_info, \%settings);
+    return &show_picture($r, $album_uri, $thumb_uri, $path_info, \%settings);
   }
 
   # if AllowFinalResize is set, it is possible that the filename
@@ -154,7 +172,9 @@ sub handler {
       my ($max_width, $max_height) = ($1, $2);
 
       if (-f "$album_dir/$check_dir/$check_filename") {
-	return &show_picture($r, $album_uri, "$check_dir/$check_filename",
+	$r->log_error("\$album_uri: $album_uri \$thumb_uri: $thumb_uri");
+	return &show_picture($r, $album_uri, $thumb_uri, 
+                             "$check_dir/$check_filename",
 			     \%settings, $max_width, $max_height);
       }
     }
@@ -182,6 +202,17 @@ sub handler {
 		       m!^image/!} readdir(IN);
   closedir(IN);
 
+  # If we have a directory, but slide_show is set, we need to grab the
+  # first file and redirect
+  if (defined $params{'slide_show'}) {
+    @files = sort(@files);
+    $r->warn("Redirecting -> " . $r->uri . $files[0] . "?slide_show="
+	     . $params{'slide_show'});
+    $r->header_out(Location => $r->uri . $files[0] . "?slide_show="
+	     . $params{'slide_show'});
+    return REDIRECT;
+  }
+
   # if @files is empty, need to call show_albums
   return &show_albums($r, "$album_dir/$path_info", $path_info, \%settings)
     unless @files;
@@ -197,20 +228,12 @@ sub handler {
   # is newer than the file it's a thumbnail for, generate the
   # thumbnail
   foreach (@files) {
-    unless ( -e "$album_dir/$path_info/$settings{ThumbSubDir}/tn__$_" && 
+    unless ( -e "$thumb_dir/$path_info/tn__$_" && 
 	     (stat(_))[9] > (stat("$album_dir/$path_info/$_"))[9] ) {
 
       # Make sure the thumbnail directory exists
-      mkdir ("$album_dir/$path_info/$settings{ThumbSubDir}", 0755) 
-	unless -d "$album_dir/$path_info/$settings{ThumbSubDir}";
-
-      # If we're allowing a final resize make sure that directory
-      # exists.  By default it's the same as the ThumbSubDir
-
-      if ($settings{'AllowFinalResize'}) {
-	mkdir("$album_dir/$path_info/$settings{FinalResizeDir}", 0755)
-	  unless -d "$album_dir/$path_info/$settings{FinalResizeDir}";
-      }
+      &mymkdir("$thumb_dir/$path_info", 0755) 
+	unless -d "$thumb_dir/$path_info";
 
       # Create a new thumbnail
       my $q = new Image::Magick;
@@ -243,9 +266,9 @@ sub handler {
 	$t_height = $t_width / $ratio if $ratio;
       }
 
-      # Sample it down, and save the file
-      $q->Sample( width => $t_width, height => $t_height );
-      $q->Write("$album_dir/$path_info/$settings{ThumbSubDir}/tn__$_");
+      # Scale it down, and save the file
+      $q->Scale( width => $t_width, height => $t_height );
+      $q->Write("$thumb_dir/$path_info/tn__$_");
 
       undef $q;
 
@@ -258,7 +281,7 @@ sub handler {
 	}
 
 	my $filename = $_;
-	push (@cleanup_subs, sub {&create_final_resize($r, \%settings, $album_dir, $path_info, $filename, $o_width, $o_height);});
+	push (@cleanup_subs, sub {&create_final_resize($r, \%settings, $album_dir, $thumb_dir, $path_info, $filename, $o_width, $o_height);});
 
       }
   
@@ -343,15 +366,15 @@ EOF
 
     if ($settings{'AllowFinalResize'}) {
       my $resize_strings = "";
-      if (-f "$album_dir/$path_info/$settings{FinalResizeDir}/640x480_$_") {
+      if (-f "$thumb_dir/$path_info/640x480_$_") {
 	$resize_strings .= qq!<A HREF="640x480_$_">Sm</A>!;
       }
 
-      if (-f "$album_dir/$path_info/$settings{FinalResizeDir}/800x600_$_") {
+      if (-f "$thumb_dir/$path_info/800x600_$_") {
 	$resize_strings .= qq! <A HREF="800x600_$_">Med</A>!;
       }
 
-      if (-f "$album_dir/$path_info/$settings{FinalResizeDir}/1024x768_$_") {
+      if (-f "$thumb_dir/$path_info/1024x768_$_") {
 	$resize_strings .= qq! <A HREF="1024x768_$_">Lg</A>!;
       }
 
@@ -367,22 +390,22 @@ EOF
 	  last; };
 	/sm/ and do {
 	  $r->print(qq!<CENTER><IMG SRC="!
-             . (-f "$album_dir/$path_info/$settings{FinalResizeDir}/640x480_$picture"
-             ? "$album_uri/$path_info/$settings{FinalResizeDir}/640x480_$picture"
+             . (-f "$thumb_dir/$path_info/640x480_$picture"
+             ? "$thumb_uri/$path_info/640x480_$picture"
 		    : "$album_uri/$path_info/$picture")
 		    . qq!" ALT="$picture"></CENTER>!);
 	  last; };
 	/med/ and do {
 	  $r->print(qq!<CENTER><IMG SRC="!
-             . (-f "$album_dir/$path_info/$settings{FinalResizeDir}/800x600_$picture"
-             ? "$album_uri/$path_info/$settings{FinalResizeDir}/800x600_$picture"
+             . (-f "$thumb_dir/$path_info/800x600_$picture"
+             ? "$thumb_uri/$path_info/800x600_$picture"
 		    : "$album_uri/$path_info/$picture")
 		    . qq!" ALT="$picture"></CENTER>!);
 	  last; };
 	/lg/ and do {
 	  $r->print(qq!<CENTER><IMG SRC="!
-             . (-f "$album_dir/$path_info/$settings{FinalResizeDir}/1024x768_$picture"
-             ? "$album_uri/$path_info/$settings{FinalResizeDir}/1024x768_$picture"
+             . (-f "$thumb_dir/$path_info/1024x768_$picture"
+             ? "$thumb_uri/$path_info/1024x768_$picture"
 		    : "$album_uri/$path_info/$picture")
 		    . qq!" ALT="$picture"></CENTER>!);
 	  last; };
@@ -392,7 +415,7 @@ EOF
     }
     else {
       $r->print(qq!<TD ALIGN="center"><TABLE BORDER=$settings{'InsideTablesBorder'}><TR><TD ALIGN="center"><A HREF="$_">! .
-		qq!<IMG SRC="$album_uri/$path_info/$settings{ThumbSubDir}/tn__$_" ALT="$_"></A>$resize_urls</TD></TR>!,
+		qq!<IMG SRC="$thumb_uri/$path_info/tn__$_" ALT="$_"></A>$resize_urls</TD></TR>!,
 		qq!<TR><TD ALIGN="center">$message</TD></TR></TABLE></TD>\n!);
       $pixels_so_far += $settings{'ThumbNailWidth'};
       $columns_so_far++;
@@ -486,14 +509,17 @@ EOF
 # such since we use ImageMagick for the thumbnails
 # For now, just show the picture and a caption
 sub show_picture {
-  my ($r, $album_uri, $path_info, $settings) = @_[0..3];
+  my ($r, $album_uri, $thumb_uri, $path_info, $settings) = @_[0..4];
   my $album_dir = $r->lookup_uri($album_uri)->filename;
-
+  my $thumb_dir = $r->lookup_uri($thumb_uri)->filename;
+  
   my $caption = $path_info;
 
   my $modified_path_info = "$album_uri/$path_info";
   my $start_link = "";
   my $end_link = "";
+  my $previousSlideShow = "";
+  my $nextSlideShow = "";
 
   $caption =~ s!.*/!!;
   $caption =~ s!\.[^.]*$!!;
@@ -506,11 +532,60 @@ sub show_picture {
   my ($path_dir,$path_file) = $path_info =~ m!(.*)/(.*)!;
 
   if ($settings->{'AllowFinalResize'}) {
-    my ($max_width, $max_height) = @_[4,5];
+    my ($max_width, $max_height) = @_[5,6];
+    if ($max_width == 0) {
+      # check if slide_show is active
+      my %params = $r->args;
+      if (defined $params{'slide_show'}) {
+	for ($params{'slide_show'}) {
+	  /sm/ and do {$max_width=640; $max_height=480; last;};
+	  /med/ and do {$max_width=800; $max_height=600; last;};
+	  /lg/ and do {$max_width=1024; $max_height=768; last;};
+	}
+
+	unless(opendir(IN,"$album_dir/$path_dir")) {
+	  $r->log_error("Couldn't open $album_dir/$path_dir: $!");
+	  return SERVER_ERROR;
+	}
+
+	my @files = grep { !/\.htaccess/ && !/^tn__/
+			     && $r->lookup_uri("$album_uri/$_")->content_type =~ 
+			       m!^image/!} readdir(IN);
+	closedir(IN);
+
+	@files = sort @files;
+	for (my $i=0; $i<(@files-1); $i++) {
+	  if ($i>0) {
+	    my $uri = $r->parsed_uri();
+	    $previousSlideShow = 
+	      "Previous: <A HREF=\"". $uri->rpath() . "/$path_dir/" 
+		. $files[$i-1]
+		  . "?slide_show=".$params{'slide_show'}
+	    . "\">$files[$i-1]</A>";
+	  }
+
+	  if ($files[$i] eq $path_file) {
+	    my $uri = $r->parsed_uri();
+	    $r->header_out(Refresh => $settings->{'SlideShowDelay'}
+			   . "; URL="
+			   . $uri->rpath()
+			   . "/$path_dir/" 
+			   . $files[$i+1] . "?slide_show="
+			   . $params{'slide_show'});
+
+	    $nextSlideShow = 
+	      "Next: <A HREF=\"". $uri->rpath() . "/$path_dir/" 
+		. $files[$i+1]
+		  . "?slide_show=".$params{'slide_show'}
+	    . "\">$files[$i+1]</A>";
+	    last;
+	  }
+	}
+      }
+    }
 
     if ($max_width > 0) {
-      $modified_path_info = "$album_uri/$path_dir/"
-	. $settings->{FinalResizeDir}
+      $modified_path_info = "$thumb_uri/$path_dir/"
       . "/${max_width}x${max_height}_$path_file";
 
       $start_link = qq!<A HREF="$path_file" BORDER="0">!;
@@ -546,11 +621,26 @@ sub show_picture {
     close (IN);
   }
 
+  my $additionalLinks = "";
+  if ($previousSlideShow || $nextSlideShow) {
+    $additionalLinks =<<EOF
+<TABLE BORDER="0" CELLPADDING="0" CELLSPACING="0" WIDTH="100%">
+<TR>
+ <TD ALIGN="left">$previousSlideShow</TD>
+ <TD ALIGN="right">$nextSlideShow</TD>
+</TR>
+</TABLE>
+<HR>
+EOF
+  ;
+  }
+
   $r->content_type('text/html');
   $r->send_http_header();
   $r->print(<<EOF);
 <HTML><HEADER><TITLE>$title</TITLE></HEADER>
 <BODY $$settings{'BodyArgs'}>
+$additionalLinks
 <CENTER>$start_link<IMG SRC="$modified_path_info" ALT="$path_info">$end_link
 <HR>
 $caption</CENTER>
@@ -560,6 +650,7 @@ $$settings{'Footer'}
 </HTML>
 EOF
   ;
+
   return OK;
 }
 
@@ -576,19 +667,9 @@ sub list_dirs {
 
   my @dirs = ();
 
-  my $thumb_dir = $settings->{'ThumbSubDir'};
-
-  if ($settings->{'AllowFinalResize'}
-      && ($settings->{'ThumbSubDir'} ne $settings->{'FinalResizeDir'})) {
-    $thumb_dir = "($thumb_dir|"
-      . $settings->{'FinalResizeDir'}
-      . ")";
-  }
-
   if (opendir(IN, "$album_dir/$directory")) {
     @dirs = grep { -d "$album_dir/$directory/$_" 
 		     && ! /^\./
-		       && ! m,$thumb_dir$,
 		   } readdir(IN);
     closedir(IN);
   }
@@ -652,7 +733,7 @@ EOF
 }
 
 sub create_final_resize {
-  my ($r, $settings, $album_dir, $path_info, $filename, $o_width, $o_height) = @_;
+  my ($r, $settings, $album_dir, $thumb_dir, $path_info, $filename, $o_width, $o_height) = @_;
 
   my $q = new Image::Magick;
   $q->Read("$album_dir/$path_info/$filename");
@@ -672,9 +753,8 @@ sub create_final_resize {
     }
     
     $q->Read("$album_dir/$path_info/$filename");
-    $q->Sample( width => 1024, height => $f_height );
-    $q->Write("$album_dir/$path_info/"
-	      . $settings->{FinalResizeDir}
+    $q->Scale( width => 1024, height => $f_height );
+    $q->Write("$thumb_dir/$path_info/"
 	      . "/1024x768_$filename");
   }
   
@@ -691,9 +771,8 @@ sub create_final_resize {
     }
     
     $q->Read("$album_dir/$path_info/$filename");
-    $q->Sample( width => 800, height => $f_height );
-    $q->Write("$album_dir/$path_info/"
-	      . $settings->{FinalResizeDir}
+    $q->Scale( width => 800, height => $f_height );
+    $q->Write("$thumb_dir/$path_info/"
 	      . "/800x600_$filename");
   }
   
@@ -710,9 +789,8 @@ sub create_final_resize {
     }
     
     $q->Read("$album_dir/$path_info/$filename");
-    $q->Sample( width => 640, height => $f_height );
-    $q->Write("$album_dir/$path_info/"
-	      . $settings->{FinalResizeDir}
+    $q->Scale( width => 640, height => $f_height );
+    $q->Write("$thumb_dir/$path_info/"
 	      . "/640x480_$filename");
   }
   
@@ -746,6 +824,20 @@ sub update_settings {
   }
 }
 
+sub mymkdir {
+  my ($dir, $mode) = @_;
+  my @dir = split('/', $dir);
+  my $curDir = "";
+
+  foreach (@dir) {
+    next unless $_;
+    $curDir .= "/$_";
+
+    mkdir($curDir, $mode)
+      unless (-d $curDir);
+  }
+}
+      
 
 
 1;
@@ -766,16 +858,16 @@ Add to httpd.conf
 #   PerlSetVar  ThumbNailUse        Width  
 #   PerlSetVar  ThumbNailWidth      100
 #   PerlSetVar  ThumbNailAspect     2/11
-#   PerlSetVar  ThumbSubDir         thumbs
+#   PerlSetVar  ThumbDir            /thumbs
 #   PerlSetVar  DefaultBrowserWidth 640
 #   PerlSetVar  NumberOfColumns     0
 #   PerlSetVar  OutsideTableBorder  0
 #   PerlSetVar  InsideTablesBorder  0
+#   PerlSetVar  SlideShowDelay      60
 #   PerlSetVar  BodyArgs            BGCOLOR=white
 #   PerlSetVar  Footer              "<EM>Optional Footer Here</EM>"
 #   PerlSetVar  EditMode            0
 #   PerlSetVar  AllowFinalResize    0
-#   PerlSetVar  FinalResizeDir      thumbs
 #   PerlSetVar  ReverseDirs         0
 #   PerlSetVar  ReversePics         0
  </Location>
@@ -829,7 +921,7 @@ you would need an entry like:
   Options None
   PerlHandler Apache::Album
   PerlSetVar  AlbumDir /jdw/albums_loc
-  PerlSetVar  Footer   "<a href=\"mailto:woody@bga.com\">Jim Woodgate</a>"
+  PerlSetVar  Footer   "<a href=\"mailto:woody@realtime.net\">Jim Woodgate</a>"
  </Location>
 
 Note how AlbumDir points to the url where the files exist, and the url
@@ -908,12 +1000,14 @@ directory, the next time the page is loaded all the thumbnails will be
 regenerated.  (Naturally image names that start with tn__ should be
 renamed before placing them in the album directory.)
 
-=item ThumbSubDir
+=item ThumbDir
 
-If you want your thumbnails to be in a different directory than the
-original pictures, set C<ThumbSubDir> which is the subdirectory the
-thumbnails will be created in and viewed from.  (This could also be
-used to allow multiple sets of thumbnails).
+URI which points to where the thumbnail hierarchy will live.  Note
+that in previous versions a thumbs subdirectory would be created.
+This made traversal a bit more difficult and always made permission
+creating a challenge.  By putting all images created by the server in
+one place we can easily track diskspace usage and make sure the server
+sets up all permissions.
 
 =item DefaultBrowserWidth
 
@@ -948,6 +1042,11 @@ This variable's value is passed to the outer table's BORDER attribute.
 This variables's value is passed to all the inner table's BORDER
 attributes.  Note that the name of the C<InnerTablesBorder> has an 's'
 in it, as it modifes all the inner tables.
+
+=item SlideShowDelay
+
+The number of seconds to spend on each picture when viewing a slide
+show.
 
 =item Footer
 
@@ -1015,13 +1114,13 @@ no thumbnail will be created.
 
 =head1 COPYRIGHT
 
-Copyright (c) 1998-2000 Jim Woodgate. All rights reserved. This
+Copyright (c) 1998-2001 Jim Woodgate. All rights reserved. This
 program is free software; you can redistribute it and/or modify it
 under the same terms as Perl itself.
 
 =head1 AUTHOR
 
-Jim Woodgate woody@bga.com
+Jim Woodgate woody@realtime.net
 
 =head1 SEE ALSO
 

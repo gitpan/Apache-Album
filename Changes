@@ -1,4 +1,9 @@
 Revision history for mod_perl module Apache::Album.
+0.95  Tue Sep 25 21:52:00 2001
+        - Added Slide Show and previous/next links
+        - Moved all thumbnails and sm/med/lg files to a totally
+          seperate directory.  This should help with permission
+          problems.
 0.94  Sat Jun 10 16:01:00 2000
         - Fixed bug where not all small/med/large pictures were being
           created.
@@ -24,7 +29,6 @@ Revision history for mod_perl module Apache::Album.
           of directories/pictures
         - Added EditMode which if set allows the end user to create new albums
           and upload pictures
- 
 0.01  Mon Sep 14 13:19:21 1998
 	- original version; created by h2xs 1.18
 
