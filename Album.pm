@@ -3,30 +3,38 @@ package Apache::Album;
 # For detailed information on this module, please see
 # the pod data at the bottom of this file
 #
-# Copyright 1998-2001 James D Woodgate.  All rights reserved.
+# Copyright 1998-2004 James D Woodgate.  All rights reserved.
 # It may be used and modified freely, but I do request that this copyright
 # notice remain attached to the file.  You may modify this module as you 
 # wish, but if you redistribute a modified version, please attach a note
 # listing the modifications you have made.
 
 use Image::Magick;
-use strict;
 use vars qw($VERSION);
-use Apache::Constants qw/:common REDIRECT/;
-use Apache::Request;
-use Apache::URI ();
 
-$VERSION = '0.95';
+use Apache2::RequestRec ();
+use Apache2::RequestIO ();
+use Apache2::SubRequest ();
+use APR::Pool ();
+use APR::URI ();
+use Apache2::URI ();
+
+use Apache2::Const -compile => qw(OK SERVER_ERROR REDIRECT);
+ 
+$VERSION = '1.00';
 
 sub handler {
-  my $r = Apache::Request->new(shift);
+  my $r;
+  $r = shift if $ENV{MOD_PERL};
   
   # All the configurable values will be stored in %settings
 
   my %settings;
   
+  $settings{'AlbumTitle'} = 
+    $r->dir_config('AlbumTitle')          || "Available Albums";
   $settings{'AlbumDir'} = 
-    $r->dir_config('AlbumDir')            || "/albums_loc";
+    $r->dir_config->get('AlbumDir')            || "/albums_loc";
   $settings{'ThumbNailUse'} = 
     lc($r->dir_config('ThumbNailUse'))    || "width";
   $settings{'ThumbNailWidth'} = 
@@ -52,11 +60,13 @@ sub handler {
       . '<a href="?slide_show=sm">small</a> | '
       . '<a href="?slide_show=med">medium</a> | '
       . '<a href="?slide_show=lg">large</a> | '
+      . '<a href="?slide_show=xlg">xlarge</a> | '
       . '<a href="?slide_show=full">full sized</a></center><br>'
       . '<center>All Images: '
       . '<a href="?all_full_images=sm">small</a> | '
       . '<a href="?all_full_images=med">medium</a> | '
       . '<a href="?all_full_images=lg">large</a> | '
+      . '<a href="?all_full_images=xlg">xlarge</a> | '
       . '<a href="?all_full_images">full sized</a>'
       . '</center><br><address>Apache::Album</address>';
   $settings{'EditMode'} =
@@ -84,10 +94,10 @@ sub handler {
 
   # Check and see if there was a post
   my %params = ();
-  %params = $r->method eq 'POST' ? $r->content : $r->args;
+  %params = parseArgs($r, $r->method eq 'POST' ? $r->content : $r->args);
 
 #  foreach (keys %params) {
-#    $r->log_error("$_ -> $params{$_}");
+#    $r->server->warn("$_ -> $params{$_}");
 #  }
   if ($settings{'EditMode'}) {
 
@@ -108,7 +118,7 @@ sub handler {
       else {
 	my $new_dir = "$album_dir$local_path_info$directory";
 	$new_dir =~ s!/{2,},!/!g;
-	$r->warn("Creating New Album: $new_dir");
+	$r->server->warn("Creating New Album: $new_dir");
 	mkdir($new_dir, 0755);
       }
     }
@@ -122,7 +132,7 @@ sub handler {
 	    # on NT $filename has \'s which we don't want!
 	    $filename =~ s,.*\\,,;
 
-	    $r->warn("Uploading: $filename");
+	    $r->server->warn("Uploading: $filename");
 	    my $local_path_info = $r->path_info;
 	    my $fh = $handle->fh;
 
@@ -172,7 +182,7 @@ sub handler {
       my ($max_width, $max_height) = ($1, $2);
 
       if (-f "$album_dir/$check_dir/$check_filename") {
-	$r->log_error("\$album_uri: $album_uri \$thumb_uri: $thumb_uri");
+#	$r->log_error("\$album_uri: $album_uri \$thumb_uri: $thumb_uri");
 	return &show_picture($r, $album_uri, $thumb_uri, 
                              "$check_dir/$check_filename",
 			     \%settings, $max_width, $max_height);
@@ -185,16 +195,16 @@ sub handler {
   # it and do a redirect, makes the pictures show up
   # easier later.
   unless ( $r->path_info =~ m!/$!) {
-    $r->warn("Redirecting -> " . $r->uri . "/");
-    $r->header_out(Location => $r->uri . "/");
-    return REDIRECT;
+    $r->server->warn("Redirecting -> " . $r->uri . "/");
+    $r->headers_out->{'Location'} = $r->uri . "/";
+    return Apache2::Const::REDIRECT;
   }
 
   # Try to open the directory, and read all the image file
   # that aren't thumbnails
   unless(opendir(IN,"$album_dir/$path_info")) {
     $r->log_error("Couldn't open $album_dir/$path_info: $!");
-    return SERVER_ERROR;
+    return Apache2::Const::SERVER_ERROR;
   }
 
   my @files = grep { !/\.htaccess/ && !/^tn__/
@@ -206,11 +216,11 @@ sub handler {
   # first file and redirect
   if (defined $params{'slide_show'}) {
     @files = sort(@files);
-    $r->warn("Redirecting -> " . $r->uri . $files[0] . "?slide_show="
+    $r->server->warn("Redirecting -> " . $r->uri . $files[0] . "?slide_show="
 	     . $params{'slide_show'});
-    $r->header_out(Location => $r->uri . $files[0] . "?slide_show="
-	     . $params{'slide_show'});
-    return REDIRECT;
+    $r->headers_out->{'Location'} = $r->uri . $files[0] . "?slide_show="
+	     . $params{'slide_show'};
+    return Apache2::Const::REDIRECT;
   }
 
   # if @files is empty, need to call show_albums
@@ -239,13 +249,20 @@ sub handler {
       my $q = new Image::Magick;
       unless ($q) {
 	$r->log_error("Couldn't create a new Image::Magick object");
-	return SERVER_ERROR;
+	return Apache2::Const::SERVER_ERROR;
       }
      
-      $q->Read("$album_dir/$path_info/$_");
+      # Setting the size before reading the image is dramatically
+      # faster.  The trade-off is that the quality of the resized
+      # image will be lower, which is OK for thumbnails.
+      # The actual resize (below) could be done with ->Sample() for
+      # similar reasons, but some limited testing revealed that the
+      # cumulative benefit of setting the size and using Sample was
+      # almost non-existant.  Using ->Scale() instead might have a
+      # small quality benefit.
 
       # Load up the current images width and height
-      my ($o_width, $o_height) = $q->Get('width', 'height');
+      my ($o_width, $o_height) = $q->Ping("$album_dir/$path_info/$_");
       my ($ratio, $t_width, $t_height, $t_aspect);
 
       # If we're using aspect, then multiply width and
@@ -266,6 +283,10 @@ sub handler {
 	$t_height = $t_width / $ratio if $ratio;
       }
 
+      $q->Set( size => "${t_width}x${t_height}" );
+
+      $q->Read("$album_dir/$path_info/$_");
+
       # Scale it down, and save the file
       $q->Scale( width => $t_width, height => $t_height );
       $q->Write("$thumb_dir/$path_info/tn__$_");
@@ -277,7 +298,7 @@ sub handler {
 	my $q = new Image::Magick;
 	unless ($q) {
 	  $r->log_error("Couldn't create a new Image::Magick object");
-	  return SERVER_ERROR;
+	  return Apache2::Const::SERVER_ERROR;
 	}
 
 	my $filename = $_;
@@ -288,7 +309,7 @@ sub handler {
     }
   }
 
-  $r->register_cleanup(sub {foreach (@cleanup_subs) {&$_;}})
+  $r->pool->cleanup_register(sub {foreach (@cleanup_subs) {&$_;}})
     if @cleanup_subs;
 
   # The title will be a hacked up path_info, only the
@@ -299,8 +320,8 @@ sub handler {
 
   # Send the actual web page...
   $r->content_type('text/html');
-  $r->send_http_header();
-  return OK if $r->header_only;
+  #$r->send_http_header();
+  return Apache2::Const::OK if $r->header_only;
 
   $r->print(<<EOF);
 <HTML>
@@ -326,7 +347,7 @@ EOF
   if ( -r $caption_file ) {
     unless (open (IN,$caption_file)) { 
       $r->log_error("Weird, $caption_file is readable, but I can't read it: $!");
-      return SERVER_ERROR;
+      return Apache2::Const::SERVER_ERROR;
     }
     while (<IN>) {
       $state eq "Caption" && ! /^__END__$/ and $r->print($_);
@@ -378,6 +399,10 @@ EOF
 	$resize_strings .= qq! <A HREF="1024x768_$_">Lg</A>!;
       }
 
+      if (-f "$thumb_dir/$path_info/1600x1200_$_") {
+	$resize_strings .= qq! <A HREF="1600x1200_$_">Xlg</A>!;
+      }
+
       $resize_urls = qq!<BR>$resize_strings!
 	if $resize_strings;
     }
@@ -406,6 +431,13 @@ EOF
 	  $r->print(qq!<CENTER><IMG SRC="!
              . (-f "$thumb_dir/$path_info/1024x768_$picture"
              ? "$thumb_uri/$path_info/1024x768_$picture"
+		    : "$album_uri/$path_info/$picture")
+		    . qq!" ALT="$picture"></CENTER>!);
+	  last; };
+	/xlg/ and do {
+	  $r->print(qq!<CENTER><IMG SRC="!
+             . (-f "$thumb_dir/$path_info/1600x1200_$picture"
+             ? "$thumb_uri/$path_info/1600x1200_$picture"
 		    : "$album_uri/$path_info/$picture")
 		    . qq!" ALT="$picture"></CENTER>!);
 	  last; };
@@ -440,7 +472,7 @@ EOF
 </HTML>
 EOF
 
-    return OK;
+    return Apache2::Const::OK;
 }
 
 # show_albums simply shows the albums under the directory
@@ -453,26 +485,26 @@ sub show_albums {
 
   unless ($r->uri =~ m|/$|) {
     $r->log_error("Redirecting -> " . $r->uri . "/");
-    $r->header_out(Location => $r->uri . "/");
-    return REDIRECT;
+    $r->headers_out->{Location} = $r->uri . "/";
+    return Apache2::Const::REDIRECT;
   }
 
   unless (opendir(IN,$album_dir)) {
     $r->log_error("Could not open $album_dir: $!");
-    return SERVER_ERROR;
+    return Apache2::Const::SERVER_ERROR;
   }
   
   my @dirs = grep { -d "$album_dir/$_" && ! /^\./ } readdir(IN);
   closedir(IN);
 
   $r->content_type('text/html');
-  $r->send_http_header();
-  return OK if $r->header_only;
+  #$r->send_http_header();
+  return Apache2::Const::OK if $r->header_only;
 
   $r->print(<<EOF);
-<HTML><HEADER><TITLE>Available Albums</TITLE></HEADER>
+<HTML><HEADER><TITLE>$$settings{AlbumTitle}</TITLE></HEADER>
 <BODY $$settings{'BodyArgs'}>
-<H3>Available Albums</H3>
+<H3>$$settings{AlbumTitle}</H3>
 EOF
 
   $r->print($path_info)
@@ -483,7 +515,9 @@ EOF
     if $settings->{'ReverseDirs'};
   
   foreach (@dirs) {
+    $r->print("\n<dl>\n");
     &list_dirs($r, $album_dir, $_, "", $settings );
+    $r->print("\n</dl>\n");
   }
 
   if ($settings->{'EditMode'}) {
@@ -501,7 +535,24 @@ EOF
 </BODY>
 </HTML>
 EOF
-  return OK;  
+  return Apache2::Const::OK;  
+}
+
+# parseArgs is used to turn the array of arguments
+# into a nice hash.  This is fairly lame as I'm not
+# expecting to get any duplicate values
+sub parseArgs {
+  my $r = shift;
+  my @args = @_;
+  my %params = ();
+
+  foreach (@args) {
+    /(.*)=(.*)/;
+    my ($key,$val) = ($1, $2);
+    $params{$key} = $val;
+  }
+
+  return %params;
 }
 
 # Show picture shows the actual full sized picture,
@@ -518,8 +569,8 @@ sub show_picture {
   my $modified_path_info = "$album_uri/$path_info";
   my $start_link = "";
   my $end_link = "";
-  my $previousSlideShow = "";
-  my $nextSlideShow = "";
+  my @slideShow;
+  my($prevSeven, $nextSeven);
 
   $caption =~ s!.*/!!;
   $caption =~ s!\.[^.]*$!!;
@@ -533,61 +584,87 @@ sub show_picture {
 
   if ($settings->{'AllowFinalResize'}) {
     my ($max_width, $max_height) = @_[5,6];
-    if ($max_width == 0) {
-      # check if slide_show is active
-      my %params = $r->args;
-      if (defined $params{'slide_show'}) {
-	for ($params{'slide_show'}) {
-	  /sm/ and do {$max_width=640; $max_height=480; last;};
-	  /med/ and do {$max_width=800; $max_height=600; last;};
-	  /lg/ and do {$max_width=1024; $max_height=768; last;};
-	}
+    my %params = split /=+/, $r->args;
+    my $uri = $r->parsed_uri();
+    (my $rpath = $uri->path()) =~ s,/\Q$path_dir\E/[^/]*$,,;
 
-	unless(opendir(IN,"$album_dir/$path_dir")) {
-	  $r->log_error("Couldn't open $album_dir/$path_dir: $!");
-	  return SERVER_ERROR;
-	}
+    for ($params{slide_show}) {
+      /sm/ and do {$max_width=640; $max_height=480; last;};
+      /med/ and do {$max_width=800; $max_height=600; last;};
+      /lg/ and do {$max_width=1024; $max_height=768; last;};
+      /xlg/ and do {$max_width=1600; $max_height=1200; last;};
+    }
 
-	my @files = grep { !/\.htaccess/ && !/^tn__/
-			     && $r->lookup_uri("$album_uri/$_")->content_type =~ 
-			       m!^image/!} readdir(IN);
-	closedir(IN);
+    my $imageSize = "${max_width}x${max_height}_" if $max_width;
 
-	@files = sort @files;
-	for (my $i=0; $i<(@files-1); $i++) {
-	  if ($i>0) {
-	    my $uri = $r->parsed_uri();
-	    $previousSlideShow = 
-	      "Previous: <A HREF=\"". $uri->rpath() . "/$path_dir/" 
-		. $files[$i-1]
-		  . "?slide_show=".$params{'slide_show'}
-	    . "\">$files[$i-1]</A>";
-	  }
+    unless(opendir(IN,"$album_dir/$path_dir")) {
+      $r->log_error("Couldn't open $album_dir/$path_dir: $!");
+      return Apache2::Const::SERVER_ERROR;
+    }
+    my @files = sort grep { !/\.htaccess/ && !/^tn__/
+    		            && $r->lookup_uri("$album_uri/$_")->content_type =~
+    		              m!^image/!} readdir(IN);
+    closedir(IN);
 
-	  if ($files[$i] eq $path_file) {
-	    my $uri = $r->parsed_uri();
-	    $r->header_out(Refresh => $settings->{'SlideShowDelay'}
-			   . "; URL="
-			   . $uri->rpath()
-			   . "/$path_dir/" 
-			   . $files[$i+1] . "?slide_show="
-			   . $params{'slide_show'});
+    my $fileIndex;
+    for (my $i=0; $i<@files; $i++) {
+      $fileIndex = $i if $files[$i] eq $path_file;
+      my $thumbLinkFile = $params{slide_show} ?
+           "$files[$i]?slide_show=$params{slide_show}" :
+             "$imageSize$files[$i]";
+      push @slideShow, (
+                        qq{<td}
+                        . (defined $fileIndex && $fileIndex == $i ?
+                           qq{ bgcolor="blue">} : ">")
+                        . qq{<A HREF="$rpath/$path_dir/$thumbLinkFile">}
+#                        . (defined $fileIndex && $fileIndex == $i ?
+#                           qq{<table bgcolor=blue cellspacing=0><tr><td>} : "")
+                        . qq{<img src="$thumb_uri/$path_dir/tn__$files[$i]"}
+                        . qq{ height=60 alt="$files[$i]">}
+#                        . (defined $fileIndex && $fileIndex == $i ?
+#                           qq{</td></tr></table>} : "")
+                        . qq{</A>}
+                        . qq{</td>}
+                       )
+        if ! defined $fileIndex || $fileIndex > $i - 4 || @slideShow < 7;
+      shift @slideShow if @slideShow > 7;
 
-	    $nextSlideShow = 
-	      "Next: <A HREF=\"". $uri->rpath() . "/$path_dir/" 
-		. $files[$i+1]
-		  . "?slide_show=".$params{'slide_show'}
-	    . "\">$files[$i+1]</A>";
-	    last;
-	  }
-	}
+    }
+
+    if ( @files > 7 ) {
+      if ( $fileIndex > 3 ) {
+        my $less = $fileIndex - 3 > 7 ? 7 : $fileIndex - 3;
+        my $move = $fileIndex > $#files - 3 ? $#files - $fileIndex : 0;
+        $prevSeven = qq{<A HREF="$rpath/$path_dir/} .
+          ($params{slide_show} ?
+           qq{$files[$fileIndex-$less-$move]?slide_show=$params{slide_show}} :
+           qq{$imageSize$files[$fileIndex-$less-$move]}) .
+          qq{">&lt;Prev $less&lt;</A>};
       }
+
+      if ( $fileIndex < $#files - 3 ) {
+        my $more = $#files - 3 - $fileIndex > 7 ? 7 : $#files - 3 - $fileIndex;
+        my $move = $fileIndex < 3 ? 3 - $fileIndex : 0;
+        $nextSeven = qq{<A HREF="$rpath/$path_dir/} .
+          ($params{slide_show} ?
+           qq{$files[$fileIndex+$more+$move]?slide_show=$params{slide_show}} :
+           qq{$imageSize$files[$fileIndex+$more+$move]}) .
+          qq{">&gt;Next $more&gt;</A>};
+      }
+    }
+
+    if ( $params{slide_show} && $fileIndex < $#files ) {
+      (my $next_file = $files[$fileIndex+1]) =~ s/ /%20/g;
+      $r->headers_out->{Refresh} = $settings->{'SlideShowDelay'}
+	. "; URL=$rpath/$path_dir/$next_file?slide_show=$params{slide_show}";
     }
 
     if ($max_width > 0) {
       $modified_path_info = "$thumb_uri/$path_dir/"
-      . "/${max_width}x${max_height}_$path_file";
+      . "/$imageSize$path_file";
 
+      $settings->{Footer} =~ s/\?slide_show/$path_file?slide_show/g;
+      $settings->{Footer} =~ s/\?all_full_images/.\/?all_full_images/g;
       $start_link = qq!<A HREF="$path_file" BORDER="0">!;
       $end_link = qq!</A>!;
     }
@@ -599,7 +676,7 @@ sub show_picture {
   if ( -f "$album_dir/$path_dir/caption.txt" ) {
     unless (open (IN,"$album_dir/$path_dir/caption.txt")) {
       $r->log_error("Could not open $album_dir/$path_dir/caption.txt: $!");
-      return SERVER_ERROR;
+      return Apache2::Const::SERVER_ERROR;
     }
     
     my $found_end = 0;
@@ -622,21 +699,24 @@ sub show_picture {
   }
 
   my $additionalLinks = "";
-  if ($previousSlideShow || $nextSlideShow) {
-    $additionalLinks =<<EOF
-<TABLE BORDER="0" CELLPADDING="0" CELLSPACING="0" WIDTH="100%">
-<TR>
- <TD ALIGN="left">$previousSlideShow</TD>
- <TD ALIGN="right">$nextSlideShow</TD>
+  if (@slideShow) {
+    $additionalLinks = qq{
+<center><TABLE BORDER="0" CELLPADDING="4" CELLSPACING="0">
+<TR>}
+. ($prevSeven ? qq{ <TD ALIGN="left">$prevSeven</TD>} : "")
+. "@slideShow"
+. ($nextSeven ? qq{ <TD ALIGN="right">$nextSeven</TD>} : "")
+. qq{
 </TR>
 </TABLE>
+</center>
 <HR>
-EOF
+}
   ;
   }
 
   $r->content_type('text/html');
-  $r->send_http_header();
+  #$r->send_http_header();
   $r->print(<<EOF);
 <HTML><HEADER><TITLE>$title</TITLE></HEADER>
 <BODY $$settings{'BodyArgs'}>
@@ -646,12 +726,14 @@ $additionalLinks
 $caption</CENTER>
 <HR>
 $$settings{'Footer'}
+<HR>
+<br><center><a href="."><b>Return to Album</b></a></center>
 </BODY>
 </HTML>
 EOF
   ;
 
-  return OK;
+  return Apache2::Const::OK;
 }
 
 # list_dirs takes the passed directory list
@@ -663,7 +745,7 @@ sub list_dirs {
   my $text = $directory;
   $text =~ tr[-_][  ];
   $text =~ s,\d+\((.*)\),$1,;
-  $r->print(qq!<dl><dt><A HREF="$old_directory$directory/">$text</A></dt>\n!);
+  $r->print(qq!\t<dt><A HREF="$old_directory$directory/">$text</A></dt>\n!);
 
   my @dirs = ();
 
@@ -709,11 +791,13 @@ sub list_dirs {
       if $settings->{'ReverseDirs'};
   }
   
-  foreach (@dirs) {
-    &list_dirs($r, "$album_dir/$directory", $_, "$old_directory$directory/", $settings);
+  if (@dirs) {
+    $r->print("\t<dd><dl>\n");
+    foreach (@dirs) {
+      &list_dirs($r, "$album_dir/$directory", $_, "$old_directory$directory/", $settings);
+    }
+    $r->print("\t</dl></dd>\n");
   }
-
-  $r->print(qq!</dl>!);
 }
 
 # file_upload is just the html for the file upload
@@ -740,19 +824,33 @@ sub create_final_resize {
 
   my $ratio = $o_width / $o_height if $o_height;
 
+  # X-Large is 1600x1200
+  if ($o_width > 1600) {
+    my $f_height = 0;
+    $f_height = 1600 / $ratio if $ratio;
+    
+    my $q = $q->Clone();
+    unless ($q) {
+      $r->log_error("Couldn't create a new Image::Magick object");
+      return Apache2::Const::SERVER_ERROR;
+    }
+    
+    $q->Scale( width => 1600, height => $f_height );
+    $q->Write("$thumb_dir/$path_info/"
+	      . "/1600x1200_$filename");
+  }
+  
   # Large is 1024x768
   if ($o_width > 1024) {
     my $f_height = 0;
     $f_height = 1024 / $ratio if $ratio;
     
-    undef $q;
-    $q = new Image::Magick;
+    my $q = $q->Clone();
     unless ($q) {
       $r->log_error("Couldn't create a new Image::Magick object");
-      return SERVER_ERROR;
+      return Apache2::Const::SERVER_ERROR;
     }
     
-    $q->Read("$album_dir/$path_info/$filename");
     $q->Scale( width => 1024, height => $f_height );
     $q->Write("$thumb_dir/$path_info/"
 	      . "/1024x768_$filename");
@@ -763,14 +861,12 @@ sub create_final_resize {
     my $f_height = 0;
     $f_height = 800 / $ratio if $ratio;
     
-    undef $q;
-    $q = new Image::Magick;
+    my $q = $q->Clone();
     unless ($q) {
       $r->log_error("Couldn't create a new Image::Magick object");
-      return SERVER_ERROR;
+      return Apache2::Const::SERVER_ERROR;
     }
     
-    $q->Read("$album_dir/$path_info/$filename");
     $q->Scale( width => 800, height => $f_height );
     $q->Write("$thumb_dir/$path_info/"
 	      . "/800x600_$filename");
@@ -781,14 +877,12 @@ sub create_final_resize {
     my $f_height = 0;
     $f_height = 640 / $ratio if $ratio;
     
-    undef $q;
-    $q = new Image::Magick;
+    my $q = $q->Clone();
     unless ($q) {
       $r->log_error("Couldn't create a new Image::Magick object");
-      return SERVER_ERROR;
+      return  Apache2::Const::SERVER_ERROR;
     }
     
-    $q->Read("$album_dir/$path_info/$filename");
     $q->Scale( width => 640, height => $f_height );
     $q->Write("$thumb_dir/$path_info/"
 	      . "/640x480_$filename");
@@ -1114,7 +1208,7 @@ no thumbnail will be created.
 
 =head1 COPYRIGHT
 
-Copyright (c) 1998-2001 Jim Woodgate. All rights reserved. This
+Copyright (c) 1998-2004 Jim Woodgate. All rights reserved. This
 program is free software; you can redistribute it and/or modify it
 under the same terms as Perl itself.
 
@@ -1127,3 +1221,4 @@ Jim Woodgate woody@realtime.net
 perl(1), L<Image::Magick>(3).
 
 =cut
+

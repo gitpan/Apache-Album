@@ -1,4 +1,6 @@
 Revision history for mod_perl module Apache::Album.
+0.96  Sun Mar 21 13:41:00 2010
+	- Updated to work with Apache2
 0.95  Tue Sep 25 21:52:00 2001
         - Added Slide Show and previous/next links
         - Moved all thumbnails and sm/med/lg files to a totally
